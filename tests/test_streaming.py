@@ -1,8 +1,8 @@
-"""Integration tests for the live SSE and WebSocket telemetry streams.
+"""Integration test for the live WebSocket telemetry stream.
 
-These run against a real uvicorn server in a subprocess. The streaming
-endpoints are unbounded, which the in-process Starlette TestClient cannot
-cancel, so a genuine ASGI server is required to exercise them faithfully.
+Runs against a real uvicorn server in a subprocess. The streaming endpoint is
+unbounded, which the in-process Starlette TestClient cannot cancel, so a genuine
+ASGI server is required to exercise it faithfully.
 """
 import asyncio
 import json
@@ -47,28 +47,17 @@ def server() -> str:
         proc.wait(timeout=10)
 
 
-def test_sse_stream_emits_frames(server: str):
-    """The SSE feed pushes well-formed JSON telemetry frames."""
-    with httpx.stream("GET", f"{server}/telemetry/stream", params={"hz": 20}, timeout=5) as resp:
-        assert resp.status_code == 200
-        assert "text/event-stream" in resp.headers["content-type"]
-        for line in resp.iter_lines():
-            if line.startswith("data: "):
-                frame = json.loads(line[len("data: "):])
-                assert "rpm" in frame and "speed_kmh" in frame
-                break  # disconnecting here should stop the server-side generator
-
-
 def test_websocket_pushes_frames(server: str):
-    """The WebSocket feed pushes telemetry frames until the client leaves."""
+    """The WebSocket feed pushes well-formed grouped telemetry frames."""
     import websockets  # bundled with uvicorn[standard]
 
-    ws_url = server.replace("http://", "ws://") + "/telemetry/ws?hz=20"
+    ws_url = server.replace("http://", "ws://") + "/ws/v1/telemetry/stream?hz=20"
 
     async def _read_one() -> dict:
         async with websockets.connect(ws_url) as ws:
             return json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
 
     frame = asyncio.run(_read_one())
-    assert "rpm" in frame
-    assert "timestamp" in frame
+    assert frame["car_id"]
+    assert "rpm" in frame["powertrain"]
+    assert "latitude" in frame["geospatial"]

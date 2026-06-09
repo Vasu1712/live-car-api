@@ -1,101 +1,100 @@
 """Live telemetry endpoints.
 
-Exposes the simulated ECU feed in three shapes so an agentic pipeline can
-consume it whichever way is convenient:
+Exposes the simulated connected-car feed so an agentic pipeline can consume it:
 
-* ``GET  /telemetry``         — a single live snapshot
-* ``GET  /telemetry/stream``  — Server-Sent Events, one frame per interval
-* ``WS   /telemetry/ws``      — WebSocket push of the same frames
+* ``GET  /api/v1/telemetry``        — current live frame (grouped payload)
+* ``WS   /ws/v1/telemetry/stream``  — same frames pushed continuously
+* ``POST /api/v1/engine``           — key-on / key-off
+* ``POST /api/v1/fault``            — inject / clear a DTC
 """
 import asyncio
-import json
 
-from fastapi import APIRouter, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
-from app.models.telemetry import FaultRequest, PidInfo, Telemetry
+from app.models.telemetry import (
+    FaultRequest,
+    Geospatial,
+    Powertrain,
+    SafetyBehavior,
+    Telemetry,
+    ThermalFluids,
+    VehicleState,
+)
 from app.simulator import simulator
 
-router = APIRouter(prefix="/telemetry", tags=["telemetry"])
-
-# Supported signals, advertised like a real adapter's PID scan.
-SUPPORTED_PIDS = [
-    PidInfo(pid="0x04", name="engine_load_pct", unit="%"),
-    PidInfo(pid="0x05", name="coolant_temp_c", unit="°C"),
-    PidInfo(pid="0x0C", name="rpm", unit="rev/min"),
-    PidInfo(pid="0x0D", name="speed_kmh", unit="km/h"),
-    PidInfo(pid="0x0E", name="timing_advance_deg", unit="°"),
-    PidInfo(pid="0x0F", name="intake_temp_c", unit="°C"),
-    PidInfo(pid="0x10", name="maf_gps", unit="g/s"),
-    PidInfo(pid="0x11", name="throttle_pct", unit="%"),
-    PidInfo(pid="0x2F", name="fuel_level_pct", unit="%"),
-    PidInfo(pid="0x42", name="battery_voltage", unit="V"),
-    PidInfo(pid="0x46", name="ambient_temp_c", unit="°C"),
-]
-
-# Bounds for the streaming sample rate (Hz).
-_MIN_HZ = 0.2
-_MAX_HZ = 20.0
+router = APIRouter(tags=["telemetry"])
 
 
-@router.get("", response_model=Telemetry, summary="Current telemetry snapshot")
+def _build(sample: dict) -> Telemetry:
+    """Assemble the grouped telemetry payload from a flat simulator sample."""
+    return Telemetry(
+        car_id=sample["car_id"],
+        timestamp=sample["timestamp"],
+        vehicle_state=VehicleState(
+            engine_running=sample["engine_running"],
+            ignition_status=sample["ignition_status"],
+            gear=sample["gear"],
+            odometer_km=sample["odometer_km"],
+            battery_voltage=sample["battery_voltage"],
+        ),
+        powertrain=Powertrain(
+            rpm=sample["rpm"],
+            speed_kmh=sample["speed_kmh"],
+            throttle_pct=sample["throttle_pct"],
+            engine_load_pct=sample["engine_load_pct"],
+            maf_gps=sample["maf_gps"],
+            timing_advance_deg=sample["timing_advance_deg"],
+        ),
+        thermal_fluids=ThermalFluids(
+            fuel_level_pct=sample["fuel_level_pct"],
+            fuel_rate_lph=sample["fuel_rate_lph"],
+            coolant_temp_c=sample["coolant_temp_c"],
+            ambient_temp_c=sample["ambient_temp_c"],
+            intake_temp_c=sample["intake_temp_c"],
+        ),
+        geospatial=Geospatial(
+            latitude=sample["latitude"],
+            longitude=sample["longitude"],
+            heading_deg=sample["heading_deg"],
+        ),
+        safety_behavior=SafetyBehavior(
+            harsh_braking_flag=sample["harsh_braking_flag"],
+            rapid_acceleration_flag=sample["rapid_acceleration_flag"],
+            dtc=sample["dtc"],
+        ),
+    )
+
+
+@router.get("/api/v1/telemetry", response_model=Telemetry, summary="Live telemetry frame")
 async def get_telemetry() -> Telemetry:
-    """Read one live frame, exactly as an OBD poll would return."""
-    return await simulator.read()
+    """Return one full live frame, as a connected-car poll would."""
+    return _build(await simulator.sample())
 
 
-@router.get("/pids", response_model=list[PidInfo], summary="Supported signals")
-async def list_pids() -> list[PidInfo]:
-    """List the telemetry signals this feed exposes."""
-    return SUPPORTED_PIDS
-
-
-@router.get("/stream", summary="Live telemetry as Server-Sent Events")
-async def stream_telemetry(
-    request: Request,
-    hz: float = Query(1.0, ge=_MIN_HZ, le=_MAX_HZ, description="Frames per second"),
-) -> StreamingResponse:
-    """Continuously push telemetry frames as SSE (`text/event-stream`).
-
-    Each event's ``data:`` is a JSON telemetry frame — ideal for feeding an
-    agent loop without managing a socket. The generator stops as soon as the
-    client disconnects, so dropped consumers don't leak tasks.
-    """
+@router.websocket("/ws/v1/telemetry/stream")
+async def stream_telemetry(ws: WebSocket, hz: float = 2.0) -> None:
+    """Push telemetry frames over a WebSocket until the client disconnects."""
+    hz = max(0.2, min(20.0, hz))
     interval = 1.0 / hz
-
-    async def event_source():
-        while not await request.is_disconnected():
-            frame = await simulator.read()
-            yield f"data: {frame.model_dump_json()}\n\n"
-            await asyncio.sleep(interval)
-
-    return StreamingResponse(event_source(), media_type="text/event-stream")
-
-
-@router.websocket("/ws")
-async def telemetry_ws(websocket: WebSocket, hz: float = 1.0) -> None:
-    """Stream telemetry frames over a WebSocket until the client disconnects."""
-    hz = max(_MIN_HZ, min(_MAX_HZ, hz))
-    interval = 1.0 / hz
-    await websocket.accept()
+    await ws.accept()
     try:
         while True:
-            frame = await simulator.read()
-            await websocket.send_text(frame.model_dump_json())
+            frame = _build(await simulator.sample())
+            await ws.send_text(frame.model_dump_json())
             await asyncio.sleep(interval)
     except WebSocketDisconnect:
         return
 
 
-@router.post("/engine", response_model=Telemetry, summary="Start/stop the engine")
+@router.post("/api/v1/engine", response_model=Telemetry, summary="Start / stop the engine")
 async def set_engine(running: bool = Query(..., description="True to start, False to stop")) -> Telemetry:
     """Toggle the engine so the agent can observe key-on / key-off transitions."""
     await simulator.set_engine(running)
-    return await simulator.read()
+    return _build(await simulator.sample())
 
 
-@router.post("/fault", response_model=Telemetry, summary="Inject or clear a DTC")
+@router.post("/api/v1/fault", response_model=Telemetry, summary="Inject / clear a DTC")
 async def set_fault(req: FaultRequest) -> Telemetry:
     """Set an active diagnostic trouble code (or clear it with ``null``)."""
     await simulator.set_fault(req.code)
-    return await simulator.read()
+    return _build(await simulator.sample())
